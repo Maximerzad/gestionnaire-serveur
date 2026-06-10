@@ -969,78 +969,148 @@ class DoublonFinder(ctk.CTk):
 
         for groupe in self.resultats:
             mode_nom = groupe.get("mode") == "nom"
-            emoji = "📄" if groupe["type"] == "fichier" else "📁"
+            nb_chemins = len(groupe["chemins"])
 
-            if mode_nom:
-                couleur_bord = "#FCD34D"
-                couleur_badge = ORANGE
-                label_type = f"Noms similaires  —  {groupe.get('similarite', '?')}% de ressemblance"
-            else:
-                couleur_bord = GRIS_BORDURE
-                couleur_badge = BLEU
-                label_type = ("Fichier en double" if groupe["type"] == "fichier"
-                              else "Dossier en double")
-                label_type += f"  —  {taille_lisible(groupe['taille'])} par copie"
+            couleur_bord = "#FCD34D" if mode_nom else GRIS_BORDURE
+            couleur_entete = "#FFFBEB" if mode_nom else "#EFF6FF"
 
-            card = ctk.CTkFrame(self.scroll, fg_color=GRIS_FOND, corner_radius=10,
+            card = ctk.CTkFrame(self.scroll, fg_color=GRIS_CARD, corner_radius=10,
                                 border_width=1, border_color=couleur_bord)
-            card.pack(fill="x", pady=(0, 8))
-            entete = ctk.CTkFrame(card, fg_color="transparent")
-            entete.pack(fill="x", padx=14, pady=(10, 6))
-            ctk.CTkLabel(
-                entete, text=f"{emoji}  {label_type}",
-                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-                text_color=TEXTE_PRINCIPAL
-            ).pack(side="left")
-            ctk.CTkLabel(
-                entete, text=f"{len(groupe['chemins'])} fichiers",
-                font=ctk.CTkFont(family="Segoe UI", size=11),
-                text_color="white", fg_color=couleur_badge, corner_radius=10, padx=8, pady=2
-            ).pack(side="left", padx=8)
-            if mode_nom:
-                ctk.CTkLabel(
-                    entete, text="⚠️ contenus potentiellement différents",
-                    font=ctk.CTkFont(family="Segoe UI", size=11),
-                    text_color=ORANGE
-                ).pack(side="left")
-            ctk.CTkFrame(card, fg_color=couleur_bord, height=1).pack(fill="x", padx=14)
+            card.pack(fill="x", pady=(0, 10))
 
+            # ── En-tête du groupe ────────────────────────────────────────────
+            entete = ctk.CTkFrame(card, fg_color=couleur_entete, corner_radius=8)
+            entete.pack(fill="x", padx=8, pady=(8, 4))
+            inner_e = ctk.CTkFrame(entete, fg_color="transparent")
+            inner_e.pack(fill="x", padx=14, pady=10)
+
+            if mode_nom:
+                n1 = os.path.basename(groupe["chemins"][0])
+                n2 = os.path.basename(groupe["chemins"][1]) if nb_chemins > 1 else ""
+                titre = f"⚠️  Noms similaires à {groupe.get('similarite', '?')}%"
+                sous = f"{n1}  ≈  {n2}" if n2 else n1
+                couleur_sous = ORANGE
+            else:
+                nom_rep = os.path.basename(groupe["chemins"][0])
+                emoji = "📄" if groupe["type"] == "fichier" else "📁"
+                economie = taille_lisible(groupe["taille"] * (nb_chemins - 1))
+                titre = f"{emoji}  {nom_rep}"
+                sous = (f"{nb_chemins} copies identiques  ·  {taille_lisible(groupe['taille'])} chacune"
+                        f"  →  💾 {economie} récupérables")
+                couleur_sous = BLEU
+
+            ctk.CTkLabel(
+                inner_e, text=titre,
+                font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+                text_color=TEXTE_PRINCIPAL, anchor="w"
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                inner_e, text=sous,
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                text_color=couleur_sous, anchor="w"
+            ).pack(anchor="w", pady=(3, 0))
+
+            # ── Ligne de séparation ──────────────────────────────────────────
+            ctk.CTkFrame(card, fg_color=couleur_bord, height=1).pack(fill="x", padx=8)
+
+            # ── Fichiers du groupe ───────────────────────────────────────────
             cases_groupe = []
             for j, chemin in enumerate(groupe["chemins"]):
-                row = ctk.CTkFrame(card, fg_color="transparent")
-                row.pack(fill="x", padx=14, pady=3)
-                if j == 0:
-                    ctk.CTkLabel(
-                        row, text="✓ Conserver",
+                try:
+                    st = os.stat(chemin)
+                    taille_ind = taille_lisible(st.st_size)
+                    mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%d/%m/%Y")
+                except OSError:
+                    taille_ind = "—"
+                    mtime_str = "—"
+
+                is_first = (j == 0)
+                bg_row = "#F0FDF4" if (is_first and not mode_nom) else "transparent"
+
+                row = ctk.CTkFrame(card, fg_color=bg_row, corner_radius=6)
+                row.pack(fill="x", padx=8, pady=(0, 2))
+                inner_r = ctk.CTkFrame(row, fg_color="transparent")
+                inner_r.pack(fill="x", padx=12, pady=8)
+
+                # Colonne gauche : badge ou case à cocher
+                col_left = ctk.CTkFrame(inner_r, fg_color="transparent", width=110)
+                col_left.pack(side="left", fill="y")
+                col_left.pack_propagate(False)
+
+                if mode_nom:
+                    var = ctk.BooleanVar(value=False)
+                    var.trace_add("write", lambda *_: self._update_espace_recuperable())
+                    ctk.CTkCheckBox(
+                        col_left, text="Supprimer", variable=var,
+                        fg_color=ROUGE, hover_color=ROUGE_HOVER,
+                        checkmark_color="white", width=18,
                         font=ctk.CTkFont(family="Segoe UI", size=11),
-                        text_color=VERT, width=80
-                    ).pack(side="left")
+                        text_color=TEXTE_SECONDAIRE
+                    ).pack(anchor="w", pady=(4, 0))
+                    cases_groupe.append((var, chemin, groupe["type"], groupe["taille"]))
+                elif is_first:
+                    badge = ctk.CTkLabel(
+                        col_left, text="✅  Conserver",
+                        font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                        text_color=VERT, fg_color="#DCFCE7",
+                        corner_radius=6, padx=8, pady=3
+                    )
+                    badge.pack(anchor="w")
                 else:
                     var = ctk.BooleanVar(value=False)
                     var.trace_add("write", lambda *_: self._update_espace_recuperable())
                     ctk.CTkCheckBox(
-                        row, text="", variable=var,
+                        col_left, text="Supprimer", variable=var,
                         fg_color=ROUGE, hover_color=ROUGE_HOVER,
-                        checkmark_color="white", width=20
-                    ).pack(side="left")
+                        checkmark_color="white", width=18,
+                        font=ctk.CTkFont(family="Segoe UI", size=11),
+                        text_color=ROUGE
+                    ).pack(anchor="w", pady=(4, 0))
                     cases_groupe.append((var, chemin, groupe["type"], groupe["taille"]))
 
+                # Colonne centrale : nom + chemin
+                col_mid = ctk.CTkFrame(inner_r, fg_color="transparent")
+                col_mid.pack(side="left", fill="x", expand=True, padx=(10, 8))
+
                 nom = os.path.basename(chemin)
-                parent = os.path.dirname(chemin)
-                affichage = parent if len(parent) < 55 else "..." + parent[-52:]
+                chemin_parent = os.path.dirname(chemin)
+                aff_parent = chemin_parent if len(chemin_parent) < 68 else "..." + chemin_parent[-65:]
+
                 ctk.CTkLabel(
-                    row, text=nom,
+                    col_mid, text=nom,
                     font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
                     text_color=TEXTE_PRINCIPAL, anchor="w"
-                ).pack(side="left", padx=(8, 4))
+                ).pack(anchor="w")
                 lbl_p = ctk.CTkLabel(
-                    row, text=affichage,
+                    col_mid, text=aff_parent,
                     font=ctk.CTkFont(family="Segoe UI", size=11),
                     text_color=TEXTE_SECONDAIRE, anchor="w"
                 )
-                lbl_p.pack(side="left")
-                if len(parent) >= 55:
-                    Tooltip(lbl_p, parent)
+                lbl_p.pack(anchor="w", pady=(1, 0))
+                if len(chemin_parent) >= 68:
+                    Tooltip(lbl_p, chemin_parent)
+
+                # Colonne droite : taille + date
+                col_right = ctk.CTkFrame(inner_r, fg_color="transparent")
+                col_right.pack(side="right")
+                ctk.CTkLabel(
+                    col_right, text=taille_ind,
+                    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                    text_color=TEXTE_PRINCIPAL
+                ).pack(anchor="e")
+                ctk.CTkLabel(
+                    col_right, text=f"modifié le {mtime_str}",
+                    font=ctk.CTkFont(family="Segoe UI", size=10),
+                    text_color=TEXTE_SECONDAIRE
+                ).pack(anchor="e", pady=(2, 0))
+
+            if mode_nom:
+                ctk.CTkLabel(
+                    card,
+                    text="⚠️  Contenus potentiellement différents — vérifiez avant de supprimer",
+                    font=ctk.CTkFont(family="Segoe UI", size=11),
+                    text_color=ORANGE
+                ).pack(anchor="w", padx=20, pady=(4, 10))
 
             self.cases.extend(cases_groupe)
 
