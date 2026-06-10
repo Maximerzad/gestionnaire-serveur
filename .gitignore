@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+hash_cache.db
+journal_suppressions.txt
+dist/
+build/
+*.spec

@@ -1,0 +1,30 @@
+name: Compiler le .exe Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Installer les dépendances
+        run: pip install customtkinter pyinstaller
+
+      - name: Compiler le .exe
+        run: >
+          pyinstaller --onefile --windowed
+          --collect-all customtkinter
+          --name "Gestionnaire de serveur"
+          doublon_finder.py
+
+      - name: Télécharger le résultat
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gestionnaire-de-serveur-Windows
+          path: "dist/Gestionnaire de serveur.exe"

@@ -1,0 +1,31 @@
+GESTIONNAIRE DE SERVEUR
+=======================
+
+DÉMARRAGE :
+-----------
+Double-cliquer sur "Lancer GestionnaireServeur.bat"
+
+(La première fois, l'installation prend 1 à 2 minutes automatiquement.)
+
+COMMENT UTILISER :
+------------------
+1. Cliquer sur "➕ Ajouter un dossier" et choisir le lecteur du serveur (ex : Z:\)
+   → Vous pouvez ajouter plusieurs dossiers pour les comparer entre eux
+2. Cocher les options souhaitées (fichiers, dossiers, noms similaires…)
+3. Cliquer sur "▶ Lancer l'analyse"
+4. Cocher les éléments à supprimer dans la liste
+5. Cliquer sur "🗑 Supprimer la sélection"
+
+OUTILS DISPONIBLES (onglet 🛠 Outils) :
+----------------------------------------
+- 📊 Espace disque    : top 10 des dossiers les plus lourds
+- 🧹 Fichiers inutiles : Thumbs.db, .tmp, .log, etc.
+- 📅 Fichiers anciens  : fichiers non modifiés depuis 6 mois, 1 an…
+- 🔒 Fichiers sensibles : fichiers au nom suspect (mdp, password…)
+
+IMPORTANT :
+-----------
+- Le premier fichier de chaque groupe est toujours marqué "Conserver"
+- La suppression est DÉFINITIVE — vérifiez bien avant de confirmer
+- Pour le serveur : choisissez le lecteur réseau mappé (ex : Z:\, S:\)
+- En cas de problème, contacter votre responsable informatique
