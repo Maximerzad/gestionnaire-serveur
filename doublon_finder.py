@@ -12,6 +12,7 @@ import difflib
 import unicodedata
 import re
 from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -42,7 +43,7 @@ CACHE_PATH   = os.path.join(APP_DIR, "hash_cache.db")
 PARTIAL_CHUNK = 65536  # 64 Ko — taille du hash partiel
 
 
-def hash_fichier(path, chunk=8192):
+def hash_fichier(path, chunk=65536):
     h = hashlib.md5()
     try:
         with open(path, "rb") as f:
@@ -797,25 +798,37 @@ class DoublonFinder(ctk.CTk):
                     0.08
                 )
 
-                # Hash partiel sur les candidats
+                # Hash partiel sur les candidats — parallélisé
                 hashes_partiels = defaultdict(list)
                 total_p = len(candidats)
                 self._debut_analyse = time.time()
-                for i, (fp, taille, mtime) in enumerate(candidats):
-                    if self._stop_analyse:
-                        self.after(0, self._on_arret)
-                        return
-                    if time.time() - dernier_update > 0.15:
-                        self._update_status(
-                            f"Pré-analyse : {os.path.basename(fp)}",
-                            0.08 + (i / total_p) * 0.37
-                        )
-                        dernier_update = time.time()
-                    h = hash_fichier_partiel(fp, taille)
-                    if h:
-                        hashes_partiels[h].append((fp, taille, mtime))
-                    else:
-                        self._inaccessibles += 1
+                nb_workers = min(8, max(1, total_p))
+                done_p = 0
+                lock_p = threading.Lock()
+                with ThreadPoolExecutor(max_workers=nb_workers) as pool:
+                    futures_p = {
+                        pool.submit(hash_fichier_partiel, fp, taille): (fp, taille, mtime)
+                        for fp, taille, mtime in candidats
+                    }
+                    for future in as_completed(futures_p):
+                        if self._stop_analyse:
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            self.after(0, self._on_arret)
+                            return
+                        fp, taille, mtime = futures_p[future]
+                        h = future.result()
+                        with lock_p:
+                            done_p += 1
+                            if h:
+                                hashes_partiels[h].append((fp, taille, mtime))
+                            else:
+                                self._inaccessibles += 1
+                        if time.time() - dernier_update > 0.15:
+                            self._update_status(
+                                f"Pré-analyse : {os.path.basename(fp)}",
+                                0.08 + (done_p / total_p) * 0.37
+                            )
+                            dernier_update = time.time()
 
                 # Ne conserver que les groupes où le hash partiel correspond à 2+ fichiers
                 vrais_candidats = [
@@ -831,30 +844,45 @@ class DoublonFinder(ctk.CTk):
                     0.45
                 )
 
-                # ── Phase 3 : hash complet + cache ──────────────────────────────
+                # ── Phase 3 : hash complet + cache — parallélisé ────────────────
                 hashes_complets = defaultdict(list)
                 total_f = len(vrais_candidats)
                 self._debut_analyse = time.time()
-                for i, (fp, taille, mtime) in enumerate(vrais_candidats):
-                    if self._stop_analyse:
-                        self.after(0, self._on_arret)
-                        return
-                    if time.time() - dernier_update > 0.15:
-                        self._update_status(
-                            f"Vérification : {os.path.basename(fp)}",
-                            0.45 + (i / max(total_f, 1)) * 0.50
-                        )
-                        dernier_update = time.time()
 
+                def _hash_avec_cache(fp, taille, mtime):
                     h = cache.get(fp, mtime, taille)
                     if h is None:
                         h = hash_fichier(fp)
                         if h:
                             cache.set(fp, mtime, taille, h)
-                        else:
-                            self._inaccessibles += 1
-                    if h:
-                        hashes_complets[h].append((fp, taille))
+                    return h
+
+                done_f = 0
+                lock_f = threading.Lock()
+                with ThreadPoolExecutor(max_workers=min(8, max(1, total_f))) as pool:
+                    futures_f = {
+                        pool.submit(_hash_avec_cache, fp, taille, mtime): (fp, taille)
+                        for fp, taille, mtime in vrais_candidats
+                    }
+                    for future in as_completed(futures_f):
+                        if self._stop_analyse:
+                            pool.shutdown(wait=False, cancel_futures=True)
+                            self.after(0, self._on_arret)
+                            return
+                        fp, taille = futures_f[future]
+                        h = future.result()
+                        with lock_f:
+                            done_f += 1
+                            if h:
+                                hashes_complets[h].append((fp, taille))
+                            else:
+                                self._inaccessibles += 1
+                        if time.time() - dernier_update > 0.15:
+                            self._update_status(
+                                f"Vérification : {os.path.basename(fp)}",
+                                0.45 + (done_f / max(total_f, 1)) * 0.50
+                            )
+                            dernier_update = time.time()
 
                 cache.commit()
 
