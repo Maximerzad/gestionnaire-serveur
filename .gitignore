@@ -1,7 +1,8 @@
 __pycache__/
-*.pyc
-hash_cache.db
-journal_suppressions.txt
-dist/
-build/
+*.py[cod]
 *.spec
+build/
+dist/
+hash_cache.db
+suppression_log.txt
+.DS_Store
