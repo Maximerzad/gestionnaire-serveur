@@ -20,7 +20,7 @@ OUTILS DISPONIBLES (onglet 🛠 Outils) :
 ----------------------------------------
 - 📊 Espace disque    : top 10 des dossiers les plus lourds
 - 🧹 Fichiers inutiles : Thumbs.db, .tmp, .log, etc.
-- 📅 Fichiers anciens  : fichiers non modifiés depuis 6 mois, 1 an…
+- 📅 Fichiers anciens  : fichiers non modifiés depuis 6 mois jusqu'à 20 ans
 - 🔒 Fichiers sensibles : fichiers au nom suspect (mdp, password…)
 
 IMPORTANT :

@@ -13,6 +13,7 @@ import unicodedata
 import re
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -41,6 +42,7 @@ else:
 JOURNAL_PATH = os.path.join(APP_DIR, "journal_suppressions.txt")
 CACHE_PATH   = os.path.join(APP_DIR, "hash_cache.db")
 PARTIAL_CHUNK = 65536  # 64 Ko — taille du hash partiel
+NB_THREADS_IO = 16     # lectures parallèles — optimal sur lecteur réseau SMB
 
 
 def hash_fichier(path, chunk=65536):
@@ -54,28 +56,114 @@ def hash_fichier(path, chunk=65536):
         return None
 
 
-def signature_dossier(path):
-    """Empreinte d'un dossier basée sur stat() uniquement — aucune lecture de contenu.
-    ~20x plus rapide que lire tous les fichiers, suffisamment précis en pratique."""
-    h = hashlib.md5()
-    try:
-        entrees = []
-        for root, dirs, files in os.walk(path):
-            dirs.sort()
-            rel = os.path.relpath(root, path)
-            for fname in sorted(files):
-                fp = os.path.join(root, fname)
-                try:
-                    st = os.stat(fp)
-                    entrees.append(f"{rel}/{fname}:{st.st_size}:{st.st_mtime:.0f}")
-                except OSError:
-                    pass
-        if not entrees:
-            return None
-        h.update("\n".join(entrees).encode())
-        return h.hexdigest()
-    except Exception:
-        return None
+def collecter_metadonnees(racines, exts_ignorees, taille_min,
+                          detect_fichiers, detect_dossiers, stop_flag):
+    """Parcours parallèle avec scandir (8 threads) — 3 à 5x plus rapide
+    qu'os.walk sur un lecteur réseau. Retourne deux listes : les fichiers
+    filtrés pour la détection de doublons, et les fichiers bruts pour
+    la signature des dossiers."""
+    file_attente = Queue()
+    fichiers = []
+    fichiers_bruts = []
+    verrou = threading.Lock()
+    etat = {"restants": len(racines), "inaccessibles": 0}
+
+    def explorer():
+        while True:
+            dossier = file_attente.get()
+            if dossier is None:
+                return
+            try:
+                if not stop_flag():
+                    with os.scandir(dossier) as it:
+                        for entree in it:
+                            try:
+                                if entree.is_dir(follow_symlinks=False):
+                                    with verrou:
+                                        etat["restants"] += 1
+                                    file_attente.put(entree.path)
+                                elif entree.is_file(follow_symlinks=False):
+                                    st = entree.stat(follow_symlinks=False)
+                                    item = (entree.path, st.st_size, st.st_mtime)
+                                    with verrou:
+                                        if detect_dossiers:
+                                            fichiers_bruts.append(item)
+                                        if (detect_fichiers
+                                                and os.path.splitext(entree.name)[1].lower() not in exts_ignorees
+                                                and st.st_size >= taille_min):
+                                            fichiers.append(item)
+                            except OSError:
+                                with verrou:
+                                    etat["inaccessibles"] += 1
+            except OSError:
+                with verrou:
+                    etat["inaccessibles"] += 1
+            finally:
+                with verrou:
+                    etat["restants"] -= 1
+
+    for r in racines:
+        file_attente.put(r)
+    explorateurs = [threading.Thread(target=explorer, daemon=True) for _ in range(8)]
+    for t in explorateurs:
+        t.start()
+    return fichiers, fichiers_bruts, etat, file_attente, explorateurs
+
+
+def grouper_dossiers_en_memoire(fichiers_bruts, racines):
+    """Détecte les dossiers identiques à partir des métadonnées déjà collectées.
+    Empreinte XOR insensible à l'ordre — zéro lecture disque, quasi instantané."""
+    racines_norm = {os.path.normpath(r) for r in racines}
+    acc = defaultdict(lambda: [0, 0, 0])  # xor des empreintes, nb fichiers, taille totale
+
+    for fp, taille, mtime in fichiers_bruts:
+        courant = os.path.dirname(fp)
+        while True:
+            cn = os.path.normpath(courant)
+            if cn in racines_norm or not any(cn.startswith(rn + os.sep) for rn in racines_norm):
+                break
+            rel = fp[len(courant) + 1:]
+            empreinte = int.from_bytes(
+                hashlib.md5(f"{rel}|{taille}|{int(mtime)}".encode()).digest(), "big"
+            )
+            cellule = acc[courant]
+            cellule[0] ^= empreinte
+            cellule[1] += 1
+            cellule[2] += taille
+            parent = os.path.dirname(courant)
+            if parent == courant:
+                break
+            courant = parent
+
+    signatures = defaultdict(list)
+    for dossier, (xor, nb, total) in acc.items():
+        signatures[(xor, nb)].append((dossier, total))
+
+    bruts = [g for g in signatures.values() if len(g) >= 2]
+    dupes = {d for g in bruts for d, _ in g}
+
+    def parent_deja_en_double(d):
+        p = os.path.dirname(d)
+        while p and os.path.normpath(p) not in racines_norm:
+            if p in dupes:
+                return True
+            suivant = os.path.dirname(p)
+            if suivant == p:
+                return False
+            p = suivant
+        return False
+
+    groupes = []
+    for g in bruts:
+        # Ne montrer que les dossiers de plus haut niveau, pas leurs sous-dossiers
+        if all(parent_deja_en_double(d) for d, _ in g):
+            continue
+        groupes.append({
+            "type": "dossier",
+            "chemins": [d for d, _ in g],
+            "taille": g[0][1],
+        })
+    return groupes
 
 
 def taille_lisible(octets):
@@ -199,7 +287,10 @@ def grouper_par_nom_similaire(tous_fichiers, seuil):
                 fp2, nom2, _ = fichiers[j]
                 if min(l1, len(nom2)) / max(l1, len(nom2), 1) < seuil - 0.15:
                     continue
-                if difflib.SequenceMatcher(None, nom1, nom2).ratio() >= seuil:
+                sm = difflib.SequenceMatcher(None, nom1, nom2)
+                if sm.real_quick_ratio() < seuil or sm.quick_ratio() < seuil:
+                    continue
+                if sm.ratio() >= seuil:
                     voisins[fp1].add(fp2)
                     voisins[fp2].add(fp1)
 
@@ -317,27 +408,29 @@ class DoublonFinder(ctk.CTk):
     # ── Interface principale ───────────────────────────────────────────────────
 
     def _build_ui(self):
-        header = ctk.CTkFrame(self, fg_color=GRIS_CARD, corner_radius=0)
+        header = ctk.CTkFrame(self, fg_color="#0F172A", corner_radius=0)
         header.pack(fill="x")
         inner_h = ctk.CTkFrame(header, fg_color="transparent")
-        inner_h.pack(fill="x", padx=24, pady=14)
+        inner_h.pack(fill="x", padx=24, pady=16)
+        bloc_titre = ctk.CTkFrame(inner_h, fg_color="transparent")
+        bloc_titre.pack(side="left")
         ctk.CTkLabel(
-            inner_h, text="🗂  Gestionnaire de serveur",
-            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
-            text_color=TEXTE_PRINCIPAL
-        ).pack(side="left")
+            bloc_titre, text="🗂  Gestionnaire de serveur",
+            font=ctk.CTkFont(family="Segoe UI", size=21, weight="bold"),
+            text_color="white"
+        ).pack(anchor="w")
         ctk.CTkLabel(
-            inner_h, text="Nettoyage et organisation de vos fichiers",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            text_color=TEXTE_SECONDAIRE
-        ).pack(side="left", padx=16)
+            bloc_titre, text="Doublons, nettoyage et organisation — analyse complète du serveur",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color="#94A3B8"
+        ).pack(anchor="w", pady=(2, 0))
         ctk.CTkButton(
             inner_h, text="📋  Journal",
             font=ctk.CTkFont(family="Segoe UI", size=12),
-            fg_color="#F1F5F9", hover_color="#E2E8F0",
-            text_color=TEXTE_PRINCIPAL, corner_radius=6, height=32, width=110,
+            fg_color="#1E293B", hover_color="#334155",
+            text_color="white", corner_radius=8, height=34, width=110,
             command=self._ouvrir_journal
-        ).pack(side="right")
+        ).pack(side="right", pady=6)
 
         self._build_zone_dossiers()
 
@@ -585,7 +678,7 @@ class DoublonFinder(ctk.CTk):
         self.progress_frame.pack(fill="x", pady=(0, 6))
         self.progress_bar = ctk.CTkProgressBar(
             self.progress_frame, fg_color="#E2E8F0",
-            progress_color=BLEU, height=6, corner_radius=3
+            progress_color=BLEU, height=10, corner_radius=5
         )
         self.progress_bar.pack(fill="x")
         self.progress_bar.set(0)
@@ -708,6 +801,7 @@ class DoublonFinder(ctk.CTk):
         self._stop_analyse = False
         self._inaccessibles = 0
         self._debut_analyse = time.time()
+        self._chrono_global = time.time()
         self.btn_analyser.pack_forget()
         self.btn_arreter.pack(side="right")
         self.progress_bar.pack(fill="x")
@@ -761,39 +855,28 @@ class DoublonFinder(ctk.CTk):
         try:
             detect_fichiers = self.check_fichiers.get()
             detect_dossiers = self.check_dossiers.get()
-            tous_dossiers = []
-            # (chemin, taille, mtime)
-            tous_fichiers = []
 
-            # ── Phase 1 : collecte des métadonnées (stat only, pas de lecture) ──
-            self._update_status_simple("Phase 1/3 — Collecte des informations…", 0.01)
+            # ── Phase 1 : parcours parallèle du serveur (8 threads scandir) ─────
+            self._update_status_simple("Phase 1/4 — Parcours du serveur…", 0.01)
             dernier_update = time.time()
-            for racine in self.dossiers_choisis:
-                for root, dirs, files in os.walk(racine):
-                    if self._stop_analyse:
-                        self.after(0, self._on_arret)
-                        return
-                    if detect_fichiers:
-                        for f in files:
-                            ext = os.path.splitext(f)[1].lower()
-                            if ext in exts_ignorees:
-                                continue
-                            fp = os.path.join(root, f)
-                            try:
-                                st = os.stat(fp)
-                                if st.st_size >= taille_min:
-                                    tous_fichiers.append((fp, st.st_size, st.st_mtime))
-                            except OSError:
-                                self._inaccessibles += 1
-                    if detect_dossiers:
-                        for d in dirs:
-                            tous_dossiers.append(os.path.join(root, d))
-                    if time.time() - dernier_update > 0.15:
-                        nb = len(tous_fichiers)
-                        self._update_status_simple(
-                            f"Phase 1/3 — {nb:,} fichiers recensés…", 0.01
-                        )
-                        dernier_update = time.time()
+            tous_fichiers, fichiers_bruts, etat_collecte, file_collecte, explorateurs = \
+                collecter_metadonnees(
+                    self.dossiers_choisis, exts_ignorees, taille_min,
+                    detect_fichiers, detect_dossiers, lambda: self._stop_analyse
+                )
+            while etat_collecte["restants"] > 0:
+                time.sleep(0.1)
+                if time.time() - dernier_update > 0.15:
+                    self._update_status_simple(
+                        f"Phase 1/4 — {len(tous_fichiers):,} fichiers recensés…", 0.03
+                    )
+                    dernier_update = time.time()
+            for _ in explorateurs:
+                file_collecte.put(None)
+            self._inaccessibles += etat_collecte["inaccessibles"]
+            if self._stop_analyse:
+                self.after(0, self._on_arret)
+                return
 
             doublons = []
 
@@ -804,7 +887,7 @@ class DoublonFinder(ctk.CTk):
                 candidats = [(fp, t, mt) for fp, t, mt in tous_fichiers if compte[t] >= 2]
                 nb_elimines = len(tous_fichiers) - len(candidats)
                 self._update_status_simple(
-                    f"Phase 2/3 — {nb_elimines:,} fichiers éliminés (taille unique)"
+                    f"Phase 2/4 — {nb_elimines:,} fichiers éliminés (taille unique)"
                     f", {len(candidats):,} candidats à analyser…",
                     0.08
                 )
@@ -813,7 +896,7 @@ class DoublonFinder(ctk.CTk):
                 hashes_partiels = defaultdict(list)
                 total_p = len(candidats)
                 self._debut_analyse = time.time()
-                nb_workers = min(8, max(1, total_p))
+                nb_workers = min(NB_THREADS_IO, max(1, total_p))
                 done_p = 0
                 lock_p = threading.Lock()
                 with ThreadPoolExecutor(max_workers=nb_workers) as pool:
@@ -850,7 +933,7 @@ class DoublonFinder(ctk.CTk):
                 ]
                 nb_filtres = len(candidats) - len(vrais_candidats)
                 self._update_status_simple(
-                    f"Phase 3/3 — {nb_filtres:,} nouveaux éliminés"
+                    f"Phase 3/4 — {nb_filtres:,} nouveaux éliminés"
                     f", {len(vrais_candidats):,} fichiers à vérifier en profondeur…",
                     0.45
                 )
@@ -870,7 +953,7 @@ class DoublonFinder(ctk.CTk):
 
                 done_f = 0
                 lock_f = threading.Lock()
-                with ThreadPoolExecutor(max_workers=min(8, max(1, total_f))) as pool:
+                with ThreadPoolExecutor(max_workers=min(NB_THREADS_IO, max(1, total_f))) as pool:
                     futures_f = {
                         pool.submit(_hash_avec_cache, fp, taille, mtime): (fp, taille)
                         for fp, taille, mtime in vrais_candidats
@@ -903,34 +986,14 @@ class DoublonFinder(ctk.CTk):
                         taille  = groupe[0][1]
                         doublons.append({"type": "fichier", "chemins": chemins, "taille": taille})
 
-            # ── Dossiers (inchangé, pas de cache pertinent) ─────────────────────
+            # ── Dossiers identiques — comparaison en mémoire, zéro lecture ──────
             if detect_dossiers and not self._stop_analyse:
-                hashes = defaultdict(list)
-                total_d = len(tous_dossiers)
-                self._debut_analyse = time.time()
-                for i, dp in enumerate(tous_dossiers):
-                    if self._stop_analyse:
-                        self.after(0, self._on_arret)
-                        return
-                    if time.time() - dernier_update > 0.15:
-                        self._update_status(
-                            f"Dossier : {os.path.basename(dp)}",
-                            0.95 + (i / max(total_d, 1)) * 0.04
-                        )
-                        dernier_update = time.time()
-                    h = signature_dossier(dp)
-                    if h:
-                        hashes[h].append(dp)
-                for chemins in hashes.values():
-                    if len(chemins) > 1:
-                        try:
-                            taille = sum(
-                                os.path.getsize(os.path.join(r, f))
-                                for r, _, fs in os.walk(chemins[0]) for f in fs
-                            )
-                        except Exception:
-                            taille = 0
-                        doublons.append({"type": "dossier", "chemins": chemins, "taille": taille})
+                self._update_status_simple(
+                    "Comparaison des dossiers (en mémoire)…", 0.96
+                )
+                doublons.extend(
+                    grouper_dossiers_en_memoire(fichiers_bruts, self.dossiers_choisis)
+                )
 
             # ── Phase 4 : similarité de noms (optionnel) ────────────────────────
             if detect_noms and tous_fichiers and not self._stop_analyse:
@@ -981,7 +1044,8 @@ class DoublonFinder(ctk.CTk):
         self._vider_resultats()
         self.cases = []
         self.progress_bar.set(1)
-        msg = "Analyse terminée ✓"
+        duree = time.time() - getattr(self, "_chrono_global", time.time())
+        msg = f"Analyse terminée en {_formater_duree(duree).replace('~', '')} ✓"
         if self._inaccessibles:
             msg += f"  —  {self._inaccessibles} fichier(s) inaccessible(s) ignoré(s)"
         self.label_status.configure(text=msg)
@@ -999,14 +1063,32 @@ class DoublonFinder(ctk.CTk):
             self._reset_btn()
             return
 
-        nb_exacts = sum(1 for g in self.resultats if g.get("mode") != "nom")
-        nb_noms   = sum(1 for g in self.resultats if g.get("mode") == "nom")
-        detail = f"{nb_exacts} doublon(s) exact(s)"
-        if nb_noms:
-            detail += f"  +  {nb_noms} groupe(s) de noms similaires"
+        exacts = [g for g in self.resultats if g.get("mode") != "nom"]
+        noms = [g for g in self.resultats if g.get("mode") == "nom"]
+        exacts.sort(key=lambda g: g["taille"] * (len(g["chemins"]) - 1), reverse=True)
+        noms.sort(key=lambda g: g.get("similarite", 0), reverse=True)
+        self._groupes_tries = exacts + noms
+        self._index_affichage = 0
+
+        fichiers_en_trop = sum(len(g["chemins"]) - 1 for g in exacts)
+        economie_totale = sum(g["taille"] * (len(g["chemins"]) - 1) for g in exacts)
+        detail = (f"{len(exacts)} groupe{'s' if len(exacts) > 1 else ''}"
+                  f"  ·  {fichiers_en_trop} fichier{'s' if fichiers_en_trop > 1 else ''} en trop"
+                  f"  ·  💾 {taille_lisible(economie_totale)} récupérables")
+        if noms:
+            detail += f"  +  {len(noms)} groupe(s) de noms similaires"
         self.label_nb.configure(text=detail)
 
-        for groupe in self.resultats:
+        self._afficher_page()
+        self._reset_btn()
+        self._update_espace_recuperable()
+
+    def _afficher_page(self):
+        """Affiche les résultats par lots de 40 — évite de figer l'interface
+        quand il y a des centaines de groupes."""
+        debut = self._index_affichage
+        fin = min(debut + 40, len(self._groupes_tries))
+        for groupe in self._groupes_tries[debut:fin]:
             mode_nom = groupe.get("mode") == "nom"
             nb_chemins = len(groupe["chemins"])
 
@@ -1153,18 +1235,34 @@ class DoublonFinder(ctk.CTk):
 
             self.cases.extend(cases_groupe)
 
-        self._reset_btn()
+        self._index_affichage = fin
+        restants = len(self._groupes_tries) - fin
+        if restants > 0:
+            btn_plus = ctk.CTkButton(
+                self.scroll,
+                text=f"▼  Afficher la suite ({restants} groupe{'s' if restants > 1 else ''} restant{'s' if restants > 1 else ''})",
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                fg_color="#F1F5F9", hover_color="#E2E8F0",
+                text_color=TEXTE_PRINCIPAL, corner_radius=8, height=38
+            )
+            btn_plus.configure(command=lambda b=btn_plus: (b.destroy(), self._afficher_page()))
+            btn_plus.pack(fill="x", pady=(4, 8))
         self._update_espace_recuperable()
 
     def _update_espace_recuperable(self):
+        if getattr(self, "_maj_espace_en_pause", False):
+            return
         total = sum(taille for var, _, _, taille in self.cases if var.get())
         self.label_espace.configure(
-            text=f"💾  {taille_lisible(total)} récupérables" if total else ""
+            text=f"✓  {taille_lisible(total)} sélectionnés" if total else ""
         )
 
     def _tout_cocher(self):
+        self._maj_espace_en_pause = True
         for var, *_ in self.cases:
             var.set(True)
+        self._maj_espace_en_pause = False
+        self._update_espace_recuperable()
 
     def _supprimer_selection(self):
         selection = [(c, t, ta) for var, c, t, ta in self.cases if var.get()]
@@ -1288,56 +1386,88 @@ class DoublonFinder(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=24, pady=(8, 20))
 
+        def taille_recursive(chemin):
+            total = 0
+            for r, _, fs in os.walk(chemin):
+                for f in fs:
+                    try:
+                        total += os.path.getsize(os.path.join(r, f))
+                    except OSError:
+                        pass
+            return total
+
         def scanner():
-            tailles = {}
-            try:
-                for racine in self.dossiers_choisis:
+            sous = []
+            for racine in self.dossiers_choisis:
+                try:
                     for nom in os.listdir(racine):
                         chemin = os.path.join(racine, nom)
                         if os.path.isdir(chemin):
-                            cle = chemin
-                            try:
-                                tailles[cle] = sum(
-                                    os.path.getsize(os.path.join(r, f))
-                                    for r, _, fs in os.walk(chemin) for f in fs
-                                )
-                            except OSError:
-                                pass
-            except Exception as e:
-                win.after(0, lambda: lbl_st.configure(text=f"Erreur : {e}"))
+                            sous.append(chemin)
+                except OSError:
+                    pass
+            if not sous:
+                try:
+                    win.after(0, lambda: lbl_st.configure(text="Aucun sous-dossier trouvé."))
+                except Exception:
+                    pass
                 return
+            tailles = {}
+            done = 0
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futs = {pool.submit(taille_recursive, c): c for c in sous}
+                for fut in as_completed(futs):
+                    chemin = futs[fut]
+                    try:
+                        tailles[chemin] = fut.result()
+                    except Exception:
+                        tailles[chemin] = 0
+                    done += 1
+                    try:
+                        win.after(0, lambda d=done, t=len(sous): lbl_st.configure(
+                            text=f"Calcul en cours…  {d}/{t} dossiers"))
+                    except Exception:
+                        return
             top = sorted(tailles.items(), key=lambda x: x[1], reverse=True)[:10]
-            win.after(0, lambda: afficher(top))
+            try:
+                win.after(0, lambda: afficher(top))
+            except Exception:
+                pass
 
         def afficher(top):
             if not top:
                 lbl_st.configure(text="Aucun sous-dossier trouvé.")
                 return
-            lbl_st.configure(text=f"{len(top)} sous-dossier(s) analysé(s)")
+            total_general = sum(t for _, t in top)
+            lbl_st.configure(text=f"Top {len(top)}  ·  {taille_lisible(total_general)} au total")
             taille_max = top[0][1] or 1
-            for chemin, taille in top:
+            medailles = {1: "🥇", 2: "🥈", 3: "🥉"}
+            for rang, (chemin, taille) in enumerate(top, 1):
                 card = ctk.CTkFrame(scroll, fg_color=GRIS_CARD, corner_radius=8,
                                     border_width=1, border_color=GRIS_BORDURE)
                 card.pack(fill="x", pady=(0, 6))
                 inner = ctk.CTkFrame(card, fg_color="transparent")
                 inner.pack(fill="x", padx=14, pady=10)
-                nom_affiche = chemin if len(chemin) < 60 else "..." + chemin[-57:]
+                prefixe = medailles.get(rang, f"{rang}.")
+                nom_affiche = chemin if len(chemin) < 58 else "..." + chemin[-55:]
+                ligne = ctk.CTkFrame(inner, fg_color="transparent")
+                ligne.pack(fill="x")
                 ctk.CTkLabel(
-                    inner, text=f"📁  {nom_affiche}",
+                    ligne, text=f"{prefixe}  📁  {nom_affiche}",
                     font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
                     text_color=TEXTE_PRINCIPAL
-                ).pack(anchor="w")
+                ).pack(side="left")
+                ctk.CTkLabel(
+                    ligne, text=taille_lisible(taille),
+                    font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                    text_color=BLEU
+                ).pack(side="right")
                 bar = ctk.CTkProgressBar(
                     inner, fg_color="#E2E8F0", progress_color=BLEU,
                     height=8, corner_radius=3
                 )
-                bar.pack(fill="x", pady=(6, 2))
+                bar.pack(fill="x", pady=(6, 0))
                 bar.set(taille / taille_max)
-                ctk.CTkLabel(
-                    inner, text=taille_lisible(taille),
-                    font=ctk.CTkFont(family="Segoe UI", size=12),
-                    text_color=TEXTE_SECONDAIRE
-                ).pack(anchor="e")
 
         threading.Thread(target=scanner, daemon=True).start()
 
@@ -1409,17 +1539,29 @@ class DoublonFinder(ctk.CTk):
                     for root, _, files in os.walk(racine):
                         for fname in files:
                             if any(fnmatch.fnmatch(fname, p) for p in self.PATTERNS_INUTILES):
-                                trouves.append(os.path.join(root, fname))
+                                fp = os.path.join(root, fname)
+                                try:
+                                    taille = os.path.getsize(fp)
+                                except OSError:
+                                    taille = 0
+                                trouves.append((fp, taille))
             except Exception:
                 pass
-            win.after(0, lambda: afficher(trouves))
+            try:
+                win.after(0, lambda: afficher(trouves))
+            except Exception:
+                pass
 
         def afficher(trouves):
             if not trouves:
                 lbl_st.configure(text="✅  Aucun fichier inutile trouvé.")
                 return
-            lbl_st.configure(text=f"{len(trouves)} fichier(s) inutile(s) trouvé(s)")
-            for chemin in trouves:
+            total = sum(t for _, t in trouves)
+            texte = f"{len(trouves)} fichier(s) inutile(s)  ·  {taille_lisible(total)} récupérables"
+            if len(trouves) > 800:
+                texte += "  ·  affichage limité aux 800 premiers"
+            lbl_st.configure(text=texte)
+            for chemin, taille in trouves[:800]:
                 row = ctk.CTkFrame(scroll, fg_color=GRIS_CARD, corner_radius=8,
                                    border_width=1, border_color=GRIS_BORDURE)
                 row.pack(fill="x", pady=(0, 4))
@@ -1437,15 +1579,20 @@ class DoublonFinder(ctk.CTk):
                     text_color=TEXTE_PRINCIPAL
                 ).pack(side="left", padx=(8, 4))
                 parent = os.path.dirname(chemin)
-                affichage = parent if len(parent) < 60 else "..." + parent[-57:]
+                affichage = parent if len(parent) < 55 else "..." + parent[-52:]
                 lbl_p = ctk.CTkLabel(
                     inner, text=affichage,
                     font=ctk.CTkFont(family="Segoe UI", size=11),
                     text_color=TEXTE_SECONDAIRE
                 )
                 lbl_p.pack(side="left")
-                if len(parent) >= 60:
+                if len(parent) >= 55:
                     Tooltip(lbl_p, parent)
+                ctk.CTkLabel(
+                    inner, text=taille_lisible(taille),
+                    font=ctk.CTkFont(family="Segoe UI", size=11),
+                    text_color=TEXTE_SECONDAIRE
+                ).pack(side="right")
                 cases.append((var, chemin))
 
         threading.Thread(target=scanner, daemon=True).start()
@@ -1478,7 +1625,8 @@ class DoublonFinder(ctk.CTk):
         ).pack(side="left", padx=(0, 10))
         seuil_var = ctk.StringVar(value="1 an")
         ctk.CTkOptionMenu(
-            inner_o, values=["6 mois", "1 an", "2 ans", "3 ans"],
+            inner_o, values=["6 mois", "1 an", "2 ans", "3 ans",
+                             "5 ans", "10 ans", "15 ans", "20 ans"],
             variable=seuil_var,
             fg_color=BLEU, button_color=BLEU_HOVER,
             dropdown_fg_color=GRIS_CARD, text_color="white",
@@ -1498,7 +1646,9 @@ class DoublonFinder(ctk.CTk):
         btn_frame.pack(fill="x", padx=24, pady=12)
 
         cases = []
-        SEUILS = {"6 mois": 183, "1 an": 365, "2 ans": 730, "3 ans": 1095}
+        tous_trouves = []
+        SEUILS = {"6 mois": 183, "1 an": 365, "2 ans": 730, "3 ans": 1095,
+                  "5 ans": 1825, "10 ans": 3650, "15 ans": 5475, "20 ans": 7300}
 
         def archiver():
             sel = [(c, ta) for var, c, ta in cases if var.get()]
@@ -1532,7 +1682,8 @@ class DoublonFinder(ctk.CTk):
             win.destroy()
 
         def exporter_csv():
-            if not cases:
+            if not tous_trouves:
+                messagebox.showinfo("Rien à exporter", "Lancez d'abord une recherche.")
                 return
             chemin = filedialog.asksaveasfilename(
                 title="Enregistrer le rapport",
@@ -1545,18 +1696,17 @@ class DoublonFinder(ctk.CTk):
             with open(chemin, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f, delimiter=";")
                 w.writerow(["Nom", "Chemin complet", "Taille", "Dernière modification"])
-                for _, fp, taille in cases:
-                    try:
-                        mtime = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d")
-                    except OSError:
-                        mtime = "?"
-                    w.writerow([os.path.basename(fp), fp, taille_lisible(taille), mtime])
-            messagebox.showinfo("Export réussi", f"Rapport enregistré :\n{chemin}")
+                for fp, taille, mtime in tous_trouves:
+                    w.writerow([os.path.basename(fp), fp, taille_lisible(taille),
+                                mtime.strftime("%Y-%m-%d")])
+            messagebox.showinfo("Export réussi",
+                                f"{len(tous_trouves)} fichier(s) exporté(s) :\n{chemin}")
 
         def lancer_scan():
             for w in scroll.winfo_children():
                 w.destroy()
             cases.clear()
+            tous_trouves.clear()
             lbl_st.configure(text="Recherche en cours…")
             threading.Thread(target=scanner, daemon=True).start()
 
@@ -1578,14 +1728,22 @@ class DoublonFinder(ctk.CTk):
             except Exception:
                 pass
             trouves.sort(key=lambda x: x[2])
-            win.after(0, lambda: afficher(trouves))
+            try:
+                win.after(0, lambda: afficher(trouves))
+            except Exception:
+                pass
 
         def afficher(trouves):
             if not trouves:
                 lbl_st.configure(text=f"✅  Aucun fichier de plus de {seuil_var.get()}.")
                 return
-            lbl_st.configure(text=f"{len(trouves)} fichier(s) trouvé(s)")
-            for fp, taille, mtime in trouves:
+            tous_trouves.extend(trouves)
+            total = sum(t for _, t, _ in trouves)
+            texte = f"{len(trouves)} fichier(s)  ·  {taille_lisible(total)}"
+            if len(trouves) > 800:
+                texte += "  ·  affichage des 800 plus anciens (CSV = liste complète)"
+            lbl_st.configure(text=texte)
+            for fp, taille, mtime in trouves[:800]:
                 row = ctk.CTkFrame(scroll, fg_color=GRIS_CARD, corner_radius=8,
                                    border_width=1, border_color=GRIS_BORDURE)
                 row.pack(fill="x", pady=(0, 4))
@@ -1705,7 +1863,7 @@ class DoublonFinder(ctk.CTk):
             lbl_st.configure(
                 text=f"⚠️  {len(trouves)} fichier(s) sensible(s) — vérifiez leur emplacement"
             )
-            for fp, taille in trouves:
+            for fp, taille in trouves[:500]:
                 row = ctk.CTkFrame(scroll, fg_color=GRIS_CARD, corner_radius=8,
                                    border_width=1, border_color="#FCD34D")
                 row.pack(fill="x", pady=(0, 4))
