@@ -13,7 +13,7 @@ import unicodedata
 import re
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
+from queue import Queue, Empty
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -404,6 +404,26 @@ class DoublonFinder(ctk.CTk):
         self._debut_analyse = None
 
         self._build_ui()
+
+        # File de communication threads → interface : tkinter n'est jamais
+        # touché depuis un thread secondaire (crash Tcl sur macOS sinon)
+        self._ui_queue = Queue()
+        self.after(80, self._pomper_ui)
+
+    def _sur_ui(self, action):
+        self._ui_queue.put(action)
+
+    def _pomper_ui(self):
+        try:
+            while True:
+                action = self._ui_queue.get_nowait()
+                try:
+                    action()
+                except Exception:
+                    pass
+        except Empty:
+            pass
+        self.after(80, self._pomper_ui)
 
     # ── Interface principale ───────────────────────────────────────────────────
 
@@ -874,8 +894,9 @@ class DoublonFinder(ctk.CTk):
             for _ in explorateurs:
                 file_collecte.put(None)
             self._inaccessibles += etat_collecte["inaccessibles"]
+            self._nb_fichiers_scannes = len(tous_fichiers)
             if self._stop_analyse:
-                self.after(0, self._on_arret)
+                self._sur_ui(self._on_arret)
                 return
 
             doublons = []
@@ -907,7 +928,7 @@ class DoublonFinder(ctk.CTk):
                     for future in as_completed(futures_p):
                         if self._stop_analyse:
                             pool.shutdown(wait=False, cancel_futures=True)
-                            self.after(0, self._on_arret)
+                            self._sur_ui(self._on_arret)
                             return
                         fp, taille, mtime = futures_p[future]
                         h = future.result()
@@ -961,7 +982,7 @@ class DoublonFinder(ctk.CTk):
                     for future in as_completed(futures_f):
                         if self._stop_analyse:
                             pool.shutdown(wait=False, cancel_futures=True)
-                            self.after(0, self._on_arret)
+                            self._sur_ui(self._on_arret)
                             return
                         fp, taille = futures_f[future]
                         h = future.result()
@@ -1012,18 +1033,21 @@ class DoublonFinder(ctk.CTk):
                 doublons.extend(groupes_nom)
 
             self.resultats = doublons
-            self.after(0, self._afficher_resultats)
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Erreur", str(e)))
-            self.after(0, self._reset_btn)
+            self._sur_ui(self._afficher_resultats)
+        except Exception as exc:
+            message = str(exc)
+            self._sur_ui(lambda m=message: messagebox.showerror("Erreur", m))
+            self._sur_ui(self._reset_btn)
 
     def _on_arret(self):
         self.label_status.configure(text="Analyse interrompue.")
         self._reset_btn()
 
     def _update_status_simple(self, texte, progression):
-        self.after(0, lambda m=texte: self.label_status.configure(text=m))
-        self.after(0, lambda p=progression: self.progress_bar.set(p))
+        def maj(m=texte, p=progression):
+            self.label_status.configure(text=m)
+            self.progress_bar.set(p)
+        self._sur_ui(maj)
 
     def _update_status(self, texte, progression):
         pct = int(progression * 100)
@@ -1033,8 +1057,10 @@ class DoublonFinder(ctk.CTk):
             restant = elapsed / progression * (1 - progression)
             eta_str = f"  ·  {_formater_duree(restant)} restantes"
         msg = f"{pct}%{eta_str}  ·  {texte}"
-        self.after(0, lambda m=msg: self.label_status.configure(text=m))
-        self.after(0, lambda p=progression: self.progress_bar.set(p))
+        def maj(m=msg, p=progression):
+            self.label_status.configure(text=m)
+            self.progress_bar.set(p)
+        self._sur_ui(maj)
 
     def _vider_resultats(self):
         for w in self.scroll.winfo_children():
@@ -1050,6 +1076,9 @@ class DoublonFinder(ctk.CTk):
             msg += f"  —  {self._inaccessibles} fichier(s) inaccessible(s) ignoré(s)"
         self.label_status.configure(text=msg)
 
+        nb_scannes = getattr(self, "_nb_fichiers_scannes", 0)
+        duree_txt = _formater_duree(duree).replace("~", "")
+
         if not self.resultats:
             self.label_nb.configure(text="")
             nb_dossiers = len(self.dossiers_choisis)
@@ -1061,6 +1090,11 @@ class DoublonFinder(ctk.CTk):
                 text_color=VERT
             ).pack(pady=40)
             self._reset_btn()
+            self.after(300, lambda: messagebox.showinfo(
+                "Analyse terminée",
+                f"🔍  {nb_scannes:,} fichiers analysés en {duree_txt}\n\n"
+                f"✅  Aucun doublon trouvé — votre serveur est bien rangé !"
+            ))
             return
 
         exacts = [g for g in self.resultats if g.get("mode") != "nom"]
@@ -1082,6 +1116,14 @@ class DoublonFinder(ctk.CTk):
         self._afficher_page()
         self._reset_btn()
         self._update_espace_recuperable()
+
+        recap = (f"🔍  {nb_scannes:,} fichiers analysés en {duree_txt}\n\n"
+                 f"📄  {len(exacts)} groupe{'s' if len(exacts) > 1 else ''} de doublons trouvé{'s' if len(exacts) > 1 else ''}\n"
+                 f"🗑  {fichiers_en_trop} fichier{'s' if fichiers_en_trop > 1 else ''} en trop\n"
+                 f"💾  {taille_lisible(economie_totale)} récupérables")
+        if noms:
+            recap += f"\n\n⚠️  + {len(noms)} groupe{'s' if len(noms) > 1 else ''} de noms similaires à vérifier"
+        self.after(300, lambda r=recap: messagebox.showinfo("Analyse terminée", r))
 
     def _afficher_page(self):
         """Affiche les résultats par lots de 40 — évite de figer l'interface
@@ -1407,10 +1449,7 @@ class DoublonFinder(ctk.CTk):
                 except OSError:
                     pass
             if not sous:
-                try:
-                    win.after(0, lambda: lbl_st.configure(text="Aucun sous-dossier trouvé."))
-                except Exception:
-                    pass
+                self._sur_ui(lambda: lbl_st.configure(text="Aucun sous-dossier trouvé."))
                 return
             tailles = {}
             done = 0
@@ -1423,16 +1462,10 @@ class DoublonFinder(ctk.CTk):
                     except Exception:
                         tailles[chemin] = 0
                     done += 1
-                    try:
-                        win.after(0, lambda d=done, t=len(sous): lbl_st.configure(
-                            text=f"Calcul en cours…  {d}/{t} dossiers"))
-                    except Exception:
-                        return
+                    self._sur_ui(lambda d=done, t=len(sous): lbl_st.configure(
+                        text=f"Calcul en cours…  {d}/{t} dossiers"))
             top = sorted(tailles.items(), key=lambda x: x[1], reverse=True)[:10]
-            try:
-                win.after(0, lambda: afficher(top))
-            except Exception:
-                pass
+            self._sur_ui(lambda: afficher(top))
 
         def afficher(top):
             if not top:
@@ -1547,10 +1580,7 @@ class DoublonFinder(ctk.CTk):
                                 trouves.append((fp, taille))
             except Exception:
                 pass
-            try:
-                win.after(0, lambda: afficher(trouves))
-            except Exception:
-                pass
+            self._sur_ui(lambda: afficher(trouves))
 
         def afficher(trouves):
             if not trouves:
@@ -1728,10 +1758,7 @@ class DoublonFinder(ctk.CTk):
             except Exception:
                 pass
             trouves.sort(key=lambda x: x[2])
-            try:
-                win.after(0, lambda: afficher(trouves))
-            except Exception:
-                pass
+            self._sur_ui(lambda: afficher(trouves))
 
         def afficher(trouves):
             if not trouves:
@@ -1854,7 +1881,7 @@ class DoublonFinder(ctk.CTk):
                                 trouves.append((fp, taille))
             except Exception:
                 pass
-            win.after(0, lambda: afficher(trouves))
+            self._sur_ui(lambda: afficher(trouves))
 
         def afficher(trouves):
             if not trouves:
