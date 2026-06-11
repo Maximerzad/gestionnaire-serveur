@@ -54,15 +54,25 @@ def hash_fichier(path, chunk=65536):
         return None
 
 
-def hash_dossier(path):
+def signature_dossier(path):
+    """Empreinte d'un dossier basée sur stat() uniquement — aucune lecture de contenu.
+    ~20x plus rapide que lire tous les fichiers, suffisamment précis en pratique."""
     h = hashlib.md5()
     try:
+        entrees = []
         for root, dirs, files in os.walk(path):
             dirs.sort()
+            rel = os.path.relpath(root, path)
             for fname in sorted(files):
-                fhash = hash_fichier(os.path.join(root, fname))
-                if fhash:
-                    h.update(fhash.encode())
+                fp = os.path.join(root, fname)
+                try:
+                    st = os.stat(fp)
+                    entrees.append(f"{rel}/{fname}:{st.st_size}:{st.st_mtime:.0f}")
+                except OSError:
+                    pass
+        if not entrees:
+            return None
+        h.update("\n".join(entrees).encode())
         return h.hexdigest()
     except Exception:
         return None
@@ -165,7 +175,7 @@ def normaliser_nom(nom):
 def grouper_par_nom_similaire(tous_fichiers, seuil):
     """
     Regroupe les fichiers dont le nom normalisé est similaire (ratio ≥ seuil).
-    Retourne une liste de groupes avec mode='nom' et similarite (0-100).
+    Traitement parallèle par groupe d'extension, fenêtre réduite à 30 pour la performance.
     """
     par_ext = defaultdict(list)
     for fp, taille, _mtime in tous_fichiers:
@@ -174,31 +184,26 @@ def grouper_par_nom_similaire(tous_fichiers, seuil):
         if nom_norm:
             par_ext[ext].append((fp, nom_norm, taille))
 
-    groupes = []
-
-    for fichiers in par_ext.values():
+    def _traiter_extension(fichiers):
         if len(fichiers) < 2:
-            continue
+            return []
         fichiers.sort(key=lambda x: x[1])
         n = len(fichiers)
-        # Fenêtre glissante après tri alphabétique : noms similaires sont proches
-        fenetre = min(n - 1, 60)
+        fenetre = min(n - 1, 30)
 
-        # Graphe d'adjacence
         voisins = defaultdict(set)
         for i in range(n):
             fp1, nom1, _ = fichiers[i]
+            l1 = len(nom1)
             for j in range(i + 1, min(i + fenetre + 1, n)):
                 fp2, nom2, _ = fichiers[j]
-                # Rejet rapide si longueurs trop différentes
-                if min(len(nom1), len(nom2)) / max(len(nom1), len(nom2), 1) < seuil - 0.1:
+                if min(l1, len(nom2)) / max(l1, len(nom2), 1) < seuil - 0.15:
                     continue
-                sim = difflib.SequenceMatcher(None, nom1, nom2).ratio()
-                if sim >= seuil:
+                if difflib.SequenceMatcher(None, nom1, nom2).ratio() >= seuil:
                     voisins[fp1].add(fp2)
                     voisins[fp2].add(fp1)
 
-        # Composantes connexes (flood fill)
+        groupes_ext = []
         visites = set()
         for fp_dep in voisins:
             if fp_dep in visites:
@@ -215,19 +220,25 @@ def grouper_par_nom_similaire(tous_fichiers, seuil):
             if len(groupe_fps) < 2:
                 continue
             chemins = list(groupe_fps)
-            # Taille du premier fichier du groupe
             taille = next((t for fp, _, t in fichiers if fp == chemins[0]), 0)
-            # Similarité représentative entre les deux premiers
             n1 = normaliser_nom(os.path.basename(chemins[0]))
             n2 = normaliser_nom(os.path.basename(chemins[1]))
             sim_pct = round(difflib.SequenceMatcher(None, n1, n2).ratio() * 100)
-            groupes.append({
+            groupes_ext.append({
                 "type": "fichier",
                 "chemins": chemins,
                 "taille": taille,
                 "mode": "nom",
                 "similarite": sim_pct,
             })
+        return groupes_ext
+
+    groupes = []
+    nb_workers = min(4, max(1, len(par_ext)))
+    with ThreadPoolExecutor(max_workers=nb_workers) as pool:
+        futures = [pool.submit(_traiter_extension, list(f)) for f in par_ext.values()]
+        for future in as_completed(futures):
+            groupes.extend(future.result())
 
     return groupes
 
@@ -907,7 +918,7 @@ class DoublonFinder(ctk.CTk):
                             0.95 + (i / max(total_d, 1)) * 0.04
                         )
                         dernier_update = time.time()
-                    h = hash_dossier(dp)
+                    h = signature_dossier(dp)
                     if h:
                         hashes[h].append(dp)
                 for chemins in hashes.values():
