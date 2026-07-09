@@ -19,7 +19,7 @@ if errorlevel 1 (
 )
 
 :: Installer les dépendances si besoin (silencieux)
-python -m pip install customtkinter --quiet 2>nul
+python -m pip install customtkinter send2trash --quiet 2>nul
 
 :: Lancer l'application
 python doublon_finder.py

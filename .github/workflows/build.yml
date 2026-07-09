@@ -16,7 +16,7 @@ jobs:
           python-version: '3.12'
 
       - name: Installer les dépendances
-        run: pip install customtkinter pyinstaller
+        run: pip install customtkinter send2trash pyinstaller
 
       - name: Compiler le .exe
         run: >

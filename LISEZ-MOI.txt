@@ -26,6 +26,10 @@ OUTILS DISPONIBLES (onglet 🛠 Outils) :
 IMPORTANT :
 -----------
 - Le premier fichier de chaque groupe est toujours marqué "Conserver"
-- La suppression est DÉFINITIVE — vérifiez bien avant de confirmer
+  (il ne peut jamais être supprimé, même avec "Tout cocher")
+- Les suppressions passent par la CORBEILLE Windows : en cas d'erreur,
+  ouvrez la Corbeille et cliquez "Restaurer"
+  (⚠️ les lecteurs réseau n'ont pas de corbeille : là, c'est définitif)
+- Après une analyse, les outils s'ouvrent instantanément (pas de nouveau scan)
 - Pour le serveur : choisissez le lecteur réseau mappé (ex : Z:\, S:\)
 - En cas de problème, contacter votre responsable informatique

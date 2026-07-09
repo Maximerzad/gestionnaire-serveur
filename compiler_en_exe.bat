@@ -19,12 +19,13 @@ if errorlevel 1 (
 )
 
 echo  [1/3] Installation des dépendances...
-python -m pip install customtkinter pyinstaller --quiet --upgrade
+python -m pip install customtkinter send2trash pyinstaller --quiet --upgrade
 
 echo  [2/3] Compilation (patientez 1 à 2 minutes)...
 pyinstaller --onefile --windowed ^
   --name "Gestionnaire de serveur" ^
   --hidden-import customtkinter ^
+  --hidden-import send2trash ^
   --hidden-import PIL ^
   --hidden-import PIL._tkinter_finder ^
   --collect-all customtkinter ^
